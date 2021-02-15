@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Serverless Email Service | Architecture for email sending within AWS...
+
+Resources:
+  APIGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: Serverless Email Service API Gateway
+      Description: Endpoint to send emails...
+      ProtocolType: HTTP
+  
+  APIGatewayStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref APIGateway
+      AutoDeploy: true
+      StageName: prod
+      AccessLogSettings:
+        DestinationArn: !GetAtt APIGatewayLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId", "ip": "$context.identity.sourceIp",
+          "caller":"$context.identity.caller",
+          "user":"$context.identity.user","requestTime":"$context.requestTime",
+          "routeKey":"$context.routeKey","status":"$context.status",
+          "error":"$context.integrationErrorMessage"}
+  
+  SendEmailRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: 'POST /send_email'
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref RouteIntegration
+  
+  RouteIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref APIGateway
+      Description: API Gateway integration with SQS
+      CredentialsArn: !GetAtt ServerlessEmailServiceRole.Arn
+
+      IntegrationType: AWS_PROXY
+      IntegrationSubtype: SQS-SendMessage
+      PayloadFormatVersion: 1.0
+      
+      RequestParameters:
+        QueueUrl: !Ref EmailServiceSQS
+        MessageBody: $request.body
+  
+  APIGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: ServerlessEmailService-API-Gateway
+      RetentionInDays: 1
+
+  EmailServiceSQS:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-sqs
+  
+  LambdaFunctionSendToSES:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-SendToSES
+      Description: >
+        Function to retrieve data from SQS and use SES to
+        send the email...
+
+      CodeUri: lambda_send_to_ses/
+      Handler: main.lambda_handler
+      Role: !GetAtt ServerlessEmailServiceRole.Arn
+      Runtime: python3.8
+
+      Events:
+        EmailServiceSQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EmailServiceSQS.Arn
+            BatchSize: 1
+            Enabled: true
+
+  SNSEmailEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: email_events_topic
+      DisplayName: email_events_topic
+      FifoTopic: false
+
+  SESConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties: 
+      Name: EmailServiceConfigurationSet
+  
+  EmailServiceEventsSQS:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-events_sqs
+  
+  EmailServiceEventsSQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EmailServiceEventsSQS
+      PolicyDocument:
+        Statement:
+          Effect: Allow
+          Principal: "*"
+          Action: "sqs:*"
+          Resource: "*"
+          Condition:
+            ArnEquals:
+              "aws:SourceArn": !Ref SNSEmailEventsTopic
+  
+  EventsSqsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SNSEmailEventsTopic
+      Endpoint: !GetAtt EmailServiceEventsSQS.Arn
+      RawMessageDelivery: true
+      Protocol: sqs
+
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: email_service_events_tracker
+      AttributeDefinitions:
+        - AttributeName: message_id
+          AttributeType: S
+        - AttributeName: event_type
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: message_id
+          KeyType: HASH
+        - AttributeName: event_type
+          KeyType: RANGE
+
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  LambdaFunctionTrackEvents:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-TrackEvents
+      Description: > 
+        Function to track received events from SES
+        related with the emails sent...
+
+      CodeUri: lambda_track_events/
+      Handler: main.lambda_handler
+      Role: !GetAtt ServerlessEmailServiceRole.Arn
+      Runtime: python3.8
+
+      Events:
+        EmailServiceSQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EmailServiceEventsSQS.Arn
+            BatchSize: 1
+            Enabled: true
+      
+      Environment:
+        Variables:
+          ConfigurationSetName: !Ref SESConfigurationSet
+          DYNAMO_TABLE: !Select [1, !Split ['/', !GetAtt DynamoDBTable.Arn]]
+  
+  # SESEventDestination:
+  #   Type: AWS::SES::ConfigurationSetEventDestination
+  #   Properties:
+  #     ConfigurationSetName: !Ref SESConfigurationSet
+  #     EventDestination:
+  #       Name: sns_destination
+  #       SNSDestination: !Ref SNSEmailEventsTopic
+  #       Enabled: true
+  #       MatchingEventTypes:
+  #         - send
+  #         - reject
+  #         - delivery
+  #         - bounce
+  #         - complaint
+  #         - click
+  #         - open
+  #         - renderingFailure
+
+  # EmailServiceS3Bucket:
+  #  Type: AWS::S3::Bucket
+  #  Properties:
+  #    BucketName: email-service-bucket
+
+  ServerlessEmailServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ServerlessEmailServiceRole
+      Description: Role for all resources into the Serverless Email Service project...
+
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+                - lambda.amazonaws.com
+                - sqs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      
+      Policies:
+        - PolicyName: SendToSESLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-SendToSES
+                Action:
+                  - lambda:*
+        
+        - PolicyName: TrackEventsLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-TrackEvents
+                Action:
+                  - lambda:*
+
+        - PolicyName: EmailSQSPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: !GetAtt EmailServiceSQS.Arn
+                Action:
+                  - sqs:*
+        
+        - PolicyName: EventsSQSPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: !GetAtt EmailServiceEventsSQS.Arn
+                Action:
+                  - sqs:*
+
+        - PolicyName: CloudWatchPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: "*"
+                Action:
+                  - logs:*
+        
+        - PolicyName: SESPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: "*"
+                Action:
+                  - ses:*
+        
+        - PolicyName: SNSPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: !Ref SNSEmailEventsTopic
+                Action:
+                  - sns:*
+
+        - PolicyName: DynamoPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: !GetAtt DynamoDBTable.Arn
+                Action:
+                  - dynamodb:*
+
+        - PolicyName: S3Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: "*"
+                Action:
+                  - s3:*
+
+      Tags:
+        - Key: "project"
+          Value: "email_service"
+        - Key: "environment"
+          Value: "prod"

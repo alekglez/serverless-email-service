@@ -1,0 +1,6 @@
+-r lambda_send_to_ses/requirements.txt
+-r lambda_track_events/requirements.txt
+
+click==7.1.2
+coverage==5.4
+requests==2.25.1

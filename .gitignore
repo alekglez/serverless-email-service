@@ -127,3 +127,10 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# PyCharm and VSCode
+.idea
+.vscode
+
+# AWS SAM
+email_service/.aws-sam
